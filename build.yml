@@ -1,0 +1,500 @@
+name: Build Fast Launcher APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Generate project files
+        run: |
+          mkdir -p app/src/main/java/com/fast/launcher
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FastLauncher"
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.fast.launcher'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.fast.launcher'
+                  minSdk 21
+                  // Mi TV 4A Pro runs Android 9; targeting 28 also avoids package-visibility limits
+                  targetSdk 28
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Fast Launcher"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:stateNotNeeded="true"
+                      android:screenOrientation="landscape"
+                      android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/fast/launcher/MainActivity.java <<'EOF'
+          package com.fast.launcher;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.ActivityNotFoundException;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ResolveInfo;
+          import android.graphics.Color;
+          import android.graphics.drawable.Drawable;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.text.TextUtils;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.AbsListView;
+          import android.widget.BaseAdapter;
+          import android.widget.FrameLayout;
+          import android.widget.GridView;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+
+          /**
+           * Minimal TV launcher: shows only the apps you pick, plus Settings and an
+           * "Add / remove apps" tile. No services, no network, no background work.
+           */
+          public class MainActivity extends Activity {
+
+              private static final String PREFS = "fast_launcher";
+              private static final String KEY_APPS = "apps";
+
+              private static final int TYPE_APP = 0;
+              private static final int TYPE_SETTINGS = 1;
+              private static final int TYPE_EDIT = 2;
+
+              private static class Tile {
+                  int type;
+                  String pkg;
+                  String label;
+                  Drawable image;
+              }
+
+              private static class AppInfo {
+                  String pkg;
+                  String label;
+              }
+
+              private PackageManager pm;
+              private GridView grid;
+              private TileAdapter adapter;
+              private final List<Tile> tiles = new ArrayList<>();
+              private final Map<String, Drawable> iconCache = new HashMap<>();
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  pm = getPackageManager();
+
+                  FrameLayout root = new FrameLayout(this);
+                  root.setBackgroundColor(Color.parseColor("#0F1419"));
+
+                  grid = new GridView(this);
+                  grid.setNumColumns(5);
+                  grid.setHorizontalSpacing(dp(16));
+                  grid.setVerticalSpacing(dp(16));
+                  grid.setPadding(dp(48), dp(48), dp(48), dp(48));
+                  grid.setClipToPadding(false);
+                  grid.setStretchMode(GridView.STRETCH_COLUMN_WIDTH);
+                  grid.setSelector(focusFrame());
+                  grid.setDrawSelectorOnTop(true);
+                  grid.setOnItemClickListener((parent, view, position, id) -> onTileClicked(tiles.get(position)));
+
+                  adapter = new TileAdapter();
+                  grid.setAdapter(adapter);
+
+                  root.addView(grid, new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  setContentView(root);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  reloadTiles();
+                  grid.requestFocus();
+              }
+
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  // Home button pressed while already on the launcher: jump back to the first tile.
+                  if (grid != null) {
+                      grid.setSelection(0);
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  // A launcher should never close itself.
+              }
+
+              // ---------------------------------------------------------------- data
+
+              private List<String> savedPackages() {
+                  String raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_APPS, "");
+                  List<String> out = new ArrayList<>();
+                  if (raw == null || raw.isEmpty()) {
+                      return out;
+                  }
+                  for (String p : raw.split(",")) {
+                      if (!p.isEmpty()) {
+                          out.add(p);
+                      }
+                  }
+                  return out;
+              }
+
+              private void savePackages(List<String> pkgs) {
+                  SharedPreferences.Editor e = getSharedPreferences(PREFS, MODE_PRIVATE).edit();
+                  e.putString(KEY_APPS, TextUtils.join(",", pkgs));
+                  e.apply();
+              }
+
+              private Intent launchIntent(String pkg) {
+                  Intent i = pm.getLeanbackLaunchIntentForPackage(pkg);
+                  if (i == null) {
+                      i = pm.getLaunchIntentForPackage(pkg);
+                  }
+                  return i;
+              }
+
+              private void reloadTiles() {
+                  tiles.clear();
+
+                  for (String pkg : savedPackages()) {
+                      if (launchIntent(pkg) == null) {
+                          continue; // uninstalled or disabled
+                      }
+                      try {
+                          Tile t = new Tile();
+                          t.type = TYPE_APP;
+                          t.pkg = pkg;
+                          t.label = pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString();
+                          Drawable icon = iconCache.get(pkg);
+                          if (icon == null) {
+                              icon = pm.getApplicationIcon(pkg);
+                              iconCache.put(pkg, icon);
+                          }
+                          t.image = icon;
+                          tiles.add(t);
+                      } catch (PackageManager.NameNotFoundException ignored) {
+                          // skip
+                      }
+                  }
+
+                  Tile settings = new Tile();
+                  settings.type = TYPE_SETTINGS;
+                  settings.label = "Settings";
+                  try {
+                      settings.image = pm.getActivityIcon(new Intent(Settings.ACTION_SETTINGS));
+                  } catch (PackageManager.NameNotFoundException ignored) {
+                      settings.image = null;
+                  }
+                  tiles.add(settings);
+
+                  Tile edit = new Tile();
+                  edit.type = TYPE_EDIT;
+                  edit.label = "Add / remove apps";
+                  edit.image = getDrawable(android.R.drawable.ic_input_add);
+                  tiles.add(edit);
+
+                  adapter.notifyDataSetChanged();
+              }
+
+              private List<AppInfo> launchableApps() {
+                  Set<String> seen = new HashSet<>();
+                  List<AppInfo> out = new ArrayList<>();
+                  String[] categories = {Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER};
+                  for (String category : categories) {
+                      Intent query = new Intent(Intent.ACTION_MAIN).addCategory(category);
+                      for (ResolveInfo ri : pm.queryIntentActivities(query, 0)) {
+                          String pkg = ri.activityInfo.packageName;
+                          if (pkg.equals(getPackageName()) || !seen.add(pkg)) {
+                              continue;
+                          }
+                          AppInfo info = new AppInfo();
+                          info.pkg = pkg;
+                          info.label = ri.loadLabel(pm).toString();
+                          out.add(info);
+                      }
+                  }
+                  Collections.sort(out, new Comparator<AppInfo>() {
+                      @Override
+                      public int compare(AppInfo a, AppInfo b) {
+                          return a.label.compareToIgnoreCase(b.label);
+                      }
+                  });
+                  return out;
+              }
+
+              // ------------------------------------------------------------- actions
+
+              private void onTileClicked(Tile tile) {
+                  switch (tile.type) {
+                      case TYPE_APP:
+                          launch(tile.pkg);
+                          break;
+                      case TYPE_SETTINGS:
+                          try {
+                              startActivity(new Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                          } catch (ActivityNotFoundException e) {
+                              Toast.makeText(this, "Settings not available", Toast.LENGTH_SHORT).show();
+                          }
+                          break;
+                      case TYPE_EDIT:
+                          showPicker();
+                          break;
+                      default:
+                          break;
+                  }
+              }
+
+              private void launch(String pkg) {
+                  Intent i = launchIntent(pkg);
+                  if (i == null) {
+                      Toast.makeText(this, "App not found", Toast.LENGTH_SHORT).show();
+                      reloadTiles();
+                      return;
+                  }
+                  try {
+                      startActivity(i);
+                  } catch (ActivityNotFoundException | SecurityException e) {
+                      Toast.makeText(this, "Could not open app", Toast.LENGTH_SHORT).show();
+                  }
+              }
+
+              private void showPicker() {
+                  final List<AppInfo> all = launchableApps();
+                  final List<String> saved = savedPackages();
+                  final String[] labels = new String[all.size()];
+                  final boolean[] checked = new boolean[all.size()];
+                  for (int i = 0; i < all.size(); i++) {
+                      labels[i] = all.get(i).label;
+                      checked[i] = saved.contains(all.get(i).pkg);
+                  }
+
+                  new AlertDialog.Builder(this)
+                          .setTitle("Choose the apps to show")
+                          .setMultiChoiceItems(labels, checked, (dialog, which, isChecked) -> checked[which] = isChecked)
+                          .setPositiveButton("Save", (dialog, which) -> {
+                              Set<String> chosen = new HashSet<>();
+                              for (int i = 0; i < all.size(); i++) {
+                                  if (checked[i]) {
+                                      chosen.add(all.get(i).pkg);
+                                  }
+                              }
+                              // Keep the existing order, then append newly chosen apps.
+                              List<String> result = new ArrayList<>();
+                              for (String pkg : saved) {
+                                  if (chosen.remove(pkg)) {
+                                      result.add(pkg);
+                                  }
+                              }
+                              for (AppInfo info : all) {
+                                  if (chosen.contains(info.pkg)) {
+                                      result.add(info.pkg);
+                                  }
+                              }
+                              savePackages(result);
+                              reloadTiles();
+                          })
+                          .setNegativeButton("Cancel", null)
+                          .show();
+              }
+
+              // ------------------------------------------------------------------ UI
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private GradientDrawable focusFrame() {
+                  GradientDrawable d = new GradientDrawable();
+                  d.setColor(Color.TRANSPARENT);
+                  d.setStroke(dp(3), Color.WHITE);
+                  d.setCornerRadius(dp(12));
+                  return d;
+              }
+
+              private class TileAdapter extends BaseAdapter {
+
+                  @Override
+                  public int getCount() {
+                      return tiles.size();
+                  }
+
+                  @Override
+                  public Object getItem(int position) {
+                      return tiles.get(position);
+                  }
+
+                  @Override
+                  public long getItemId(int position) {
+                      return position;
+                  }
+
+                  @Override
+                  public View getView(int position, View convertView, ViewGroup parent) {
+                      LinearLayout cell;
+                      ImageView icon;
+                      TextView label;
+
+                      if (convertView == null) {
+                          cell = new LinearLayout(MainActivity.this);
+                          cell.setOrientation(LinearLayout.VERTICAL);
+                          cell.setGravity(Gravity.CENTER);
+                          cell.setPadding(dp(8), dp(8), dp(8), dp(8));
+                          cell.setLayoutParams(new AbsListView.LayoutParams(
+                                  ViewGroup.LayoutParams.MATCH_PARENT, dp(120)));
+
+                          GradientDrawable bg = new GradientDrawable();
+                          bg.setColor(Color.parseColor("#1E2630"));
+                          bg.setCornerRadius(dp(12));
+                          cell.setBackground(bg);
+
+                          icon = new ImageView(MainActivity.this);
+                          icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                          cell.addView(icon, new LinearLayout.LayoutParams(dp(64), dp(64)));
+
+                          label = new TextView(MainActivity.this);
+                          label.setTextColor(Color.WHITE);
+                          label.setTextSize(14);
+                          label.setSingleLine(true);
+                          label.setEllipsize(TextUtils.TruncateAt.END);
+                          label.setGravity(Gravity.CENTER);
+                          LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                                  ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                          lp.topMargin = dp(8);
+                          cell.addView(label, lp);
+
+                          cell.setTag(new View[]{icon, label});
+                      } else {
+                          cell = (LinearLayout) convertView;
+                      }
+
+                      View[] parts = (View[]) cell.getTag();
+                      icon = (ImageView) parts[0];
+                      label = (TextView) parts[1];
+
+                      Tile t = tiles.get(position);
+                      icon.setImageDrawable(t.image);
+                      label.setText(t.label);
+                      return cell;
+                  }
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FastLauncher-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
